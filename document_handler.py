@@ -2,9 +2,11 @@
 """
 문서 형식별 처리 모듈
 각 문서 형식에 대한 번역 처리를 담당합니다.
+Streamlit Cloud 호환 버전
 """
 
 import os
+import sys
 import shutil
 import logging
 from pathlib import Path
@@ -13,6 +15,8 @@ from abc import ABC, abstractmethod
 import json
 import re
 from datetime import datetime
+import tempfile
+import fitz  # PyMuPDF
 
 logger = logging.getLogger(__name__)
 
@@ -75,151 +79,301 @@ class DocumentHandler(ABC):
 
 
 class PDFHandler(DocumentHandler):
-    """PDF 문서 처리기"""
+    """PDF 문서 처리기 - PyMuPDF 직접 사용"""
     
     def translate(self, file_path: Path, source_lang: str, target_lang: str,
                  service: str, output_dir: Path, preserve_formatting: bool,
                  enable_ocr: bool, callback: Optional[callable] = None) -> Dict:
-        """PDF 번역 실행"""
+        """PDF 번역 실행 - PyMuPDF 사용"""
         logger.info(f"PDF 번역 시작: {file_path.name}")
         
         try:
-            # pdf2zh 사용
-            from pdf2zh import translate as pdf_translate
-            from pdf2zh.doclayout import ModelInstance, OnnxModel
+            # PyMuPDF로 PDF 열기
+            pdf_document = fitz.open(str(file_path))
             
-            # 모델 로드
-            if not hasattr(ModelInstance, 'value') or ModelInstance.value is None:
-                logger.info("ONNX 모델 로딩 중...")
-                ModelInstance.value = OnnxModel.load_available()
+            # 새 PDF 생성
+            output_pdf = fitz.open()
             
-            # pdf2zh 서비스 이름 매핑
-            service_map = {
-                'openai': 'openai',
-                'google': 'google',  # pdf2zh는 'google'을 기대할 수 있음
-                'deepl': 'deepl'
-            }
+            total_pages = len(pdf_document)
             
-            # 번역 파라미터
-            params = {
-                'files': [str(file_path)],
-                'pages': None,
-                'lang_in': source_lang if source_lang != 'auto' else '',  # pdf2zh는 빈 문자열을 auto로 인식
-                'lang_out': target_lang,
-                'service': service_map.get(service, service),
-                'output': str(output_dir),
-                'thread': 4,
-                'model': ModelInstance.value
-            }
+            for page_num in range(total_pages):
+                if callback:
+                    callback(page_num + 1, total_pages, f"페이지 {page_num + 1}/{total_pages} 번역 중...")
+                
+                page = pdf_document[page_num]
+                
+                # 텍스트 추출
+                text_dict = page.get_text("dict")
+                
+                # 페이지 크기 가져오기
+                page_rect = page.rect
+                
+                # 새 페이지 생성
+                new_page = output_pdf.new_page(width=page_rect.width, height=page_rect.height)
+                
+                # 배경 이미지 복사 (있는 경우)
+                pix = page.get_pixmap(alpha=False)
+                img_data = pix.tobytes("png")
+                new_page.insert_image(page_rect, stream=img_data)
+                
+                # 텍스트 블록 번역 및 삽입
+                for block in text_dict["blocks"]:
+                    if block["type"] == 0:  # 텍스트 블록
+                        for line in block["lines"]:
+                            for span in line["spans"]:
+                                original_text = span["text"]
+                                
+                                if self._should_translate(original_text):
+                                    try:
+                                        # 텍스트 번역
+                                        translated_text = self.translator.translate_text(
+                                            original_text, source_lang, target_lang, service
+                                        )
+                                        
+                                        # 번역된 텍스트 삽입
+                                        font_size = span["size"]
+                                        flags = span["flags"]
+                                        
+                                        # 기존 텍스트 영역에 흰색 사각형 그리기 (텍스트 지우기)
+                                        bbox = span["bbox"]
+                                        rect = fitz.Rect(bbox)
+                                        new_page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1))
+                                        
+                                        # 번역된 텍스트 삽입
+                                        point = fitz.Point(bbox[0], bbox[3] - 2)  # 좌하단 기준
+                                        
+                                        # 폰트 설정
+                                        fontname = "helv"  # 기본 폰트
+                                        if "font" in span:
+                                            if "cjk" in span["font"].lower() or "korean" in span["font"].lower():
+                                                fontname = "china-s"  # CJK 폰트
+                                        
+                                        try:
+                                            new_page.insert_text(
+                                                point,
+                                                translated_text,
+                                                fontsize=font_size,
+                                                fontname=fontname,
+                                                color=(0, 0, 0)
+                                            )
+                                        except:
+                                            # 폰트 오류 시 기본 폰트 사용
+                                            new_page.insert_text(
+                                                point,
+                                                translated_text,
+                                                fontsize=font_size,
+                                                fontname="helv",
+                                                color=(0, 0, 0)
+                                            )
+                                    
+                                    except Exception as e:
+                                        logger.warning(f"텍스트 번역 실패: {e}")
+                                        # 원본 텍스트 유지
+                                        point = fitz.Point(span["bbox"][0], span["bbox"][3] - 2)
+                                        new_page.insert_text(
+                                            point,
+                                            original_text,
+                                            fontsize=span["size"],
+                                            color=(0, 0, 0)
+                                        )
             
-            logger.info(f"PDF 번역 파라미터: service={params['service']}, lang_in={params['lang_in']}, lang_out={params['lang_out']}")
+            # PDF 저장
+            output_path = output_dir / self._create_output_filename(file_path)
+            output_pdf.save(str(output_path))
             
-            # OpenAI 사용 시 환경변수 설정
-            if service == 'openai':
-                api_key = self.translator.get_api_key('openai')
-                if api_key:
-                    os.environ['OPENAI_API_KEY'] = api_key
-                    os.environ['OPENAI_MODEL'] = self.translator.openai_model
+            # 리소스 정리
+            output_pdf.close()
+            pdf_document.close()
             
-            # 번역 실행
-            logger.info("PDF 번역 실행 중...")
-            result = pdf_translate(**params)
-            
-            # 결과 파일 확인
-            mono_file = None
-            dual_file = None
-            
-            if result and len(result) > 0:
+            # 대조본 생성 (선택사항)
+            dual_path = None
+            if preserve_formatting:
                 try:
-                    mono_file, dual_file = result[0]
-                    logger.info(f"pdf2zh 반환값 - 번역본: {mono_file}, 대조본: {dual_file}")
+                    dual_path = self._create_dual_pdf(file_path, output_path, output_dir)
                 except Exception as e:
-                    logger.warning(f"pdf2zh 결과 파싱 실패: {e}")
-            
-            # 파일이 없거나 찾을 수 없는 경우 output 디렉토리에서 찾기
-            if not mono_file or not Path(mono_file).exists():
-                logger.info("출력 디렉토리에서 번역 파일 검색 중...")
-                
-                # pdf2zh의 일반적인 파일명 패턴
-                base_name = file_path.stem
-                possible_patterns = [
-                    f"{base_name}-{target_lang}.pdf",
-                    f"{base_name}_{target_lang}.pdf",
-                    f"{base_name}_translated.pdf",
-                    f"{base_name}-translated.pdf",
-                    f"{base_name}.pdf"
-                ]
-                
-                # 패턴으로 파일 찾기
-                for pattern in possible_patterns:
-                    possible_file = output_dir / pattern
-                    if possible_file.exists():
-                        mono_file = str(possible_file)
-                        logger.info(f"번역 파일 발견: {mono_file}")
-                        break
-                
-                # 패턴으로 못 찾으면 최신 PDF 파일 찾기
-                if not mono_file:
-                    import time
-                    current_time = time.time()
-                    pdf_files = list(output_dir.glob("*.pdf"))
-                    # 최근 10초 이내 생성된 파일 찾기
-                    recent_files = [
-                        f for f in pdf_files 
-                        if (current_time - f.stat().st_mtime) < 10
-                    ]
-                    
-                    if recent_files:
-                        recent_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-                        mono_file = str(recent_files[0])
-                        logger.info(f"최근 생성 파일로 추정: {mono_file}")
-                        
-                        # 대조본 찾기
-                        if len(recent_files) > 1:
-                            for f in recent_files[1:]:
-                                if 'dual' in f.name or 'side' in f.name:
-                                    dual_file = str(f)
-                                    break
-            
-            # 여전히 파일을 찾을 수 없는 경우
-            if not mono_file or not Path(mono_file).exists():
-                error_msg = f"번역된 PDF 파일을 찾을 수 없습니다. output 디렉토리: {output_dir}"
-                logger.error(error_msg)
-                logger.error(f"디렉토리 내용: {list(output_dir.glob('*.pdf'))}")
-                raise Exception(error_msg)
-            
-            # 파일 존재 확인
-            if not Path(mono_file).exists():
-                # 상대 경로인 경우 절대 경로로 변환
-                mono_file = str(output_dir / Path(mono_file).name)
-            
-            if dual_file and not Path(dual_file).exists():
-                dual_file = str(output_dir / Path(dual_file).name)
-            
-            # 이미지 내 텍스트 OCR (활성화된 경우)
-            if enable_ocr:
-                ocr = self._safe_get_ocr_engine()
-                if ocr:
-                    try:
-                        mono_file = ocr.process_pdf_with_ocr(
-                            mono_file, source_lang, target_lang, service, self.translator
-                        )
-                    except Exception as e:
-                        logger.warning(f"PDF OCR 처리 실패: {e}")
-                else:
-                    if enable_ocr:  # 사용자가 OCR을 원했지만 사용할 수 없는 경우에만 경고
-                        logger.info("OCR 기능을 사용할 수 없습니다. 일반 번역만 진행합니다.")
+                    logger.warning(f"대조본 생성 실패: {e}")
             
             return {
-                'output_file': str(mono_file),
-                'dual_file': str(dual_file) if dual_file else None,
+                'output_file': str(output_path),
+                'dual_file': str(dual_path) if dual_path else None,
                 'format': 'pdf',
-                'pages': 0  # TODO: 실제 페이지 수 계산
+                'pages': total_pages
             }
             
         except Exception as e:
             logger.error(f"PDF 번역 실패: {e}")
+            
+            # 폴백: 간단한 텍스트 추출 및 번역
+            try:
+                return self._fallback_pdf_translation(
+                    file_path, source_lang, target_lang, service, output_dir
+                )
+            except Exception as fallback_error:
+                logger.error(f"폴백 번역도 실패: {fallback_error}")
+                raise
+    
+    def _fallback_pdf_translation(self, file_path: Path, source_lang: str, 
+                                 target_lang: str, service: str, output_dir: Path) -> Dict:
+        """폴백: 단순 텍스트 추출 후 새 PDF 생성"""
+        logger.info("폴백 PDF 번역 모드 사용")
+        
+        try:
+            # PDF에서 텍스트 추출
+            pdf_document = fitz.open(str(file_path))
+            
+            # 텍스트 수집
+            all_text = []
+            for page_num in range(len(pdf_document)):
+                page = pdf_document[page_num]
+                text = page.get_text()
+                if text.strip():
+                    all_text.append(f"[Page {page_num + 1}]\n{text}")
+            
+            full_text = "\n\n".join(all_text)
+            
+            # 전체 텍스트 번역
+            translated_text = ""
+            if full_text:
+                # 텍스트를 청크로 분할 (너무 길면 API 제한에 걸릴 수 있음)
+                chunks = self._split_text(full_text, 3000)
+                translated_chunks = []
+                
+                for chunk in chunks:
+                    if self._should_translate(chunk):
+                        try:
+                            translated_chunk = self.translator.translate_text(
+                                chunk, source_lang, target_lang, service
+                            )
+                            translated_chunks.append(translated_chunk)
+                        except Exception as e:
+                            logger.warning(f"청크 번역 실패: {e}")
+                            translated_chunks.append(chunk)
+                    else:
+                        translated_chunks.append(chunk)
+                
+                translated_text = "\n\n".join(translated_chunks)
+            
+            # 새 PDF 생성 (텍스트만)
+            output_pdf = fitz.open()
+            
+            # A4 크기 페이지 생성
+            page_width = 595  # A4 width in points
+            page_height = 842  # A4 height in points
+            
+            # 텍스트를 페이지에 맞게 분할
+            lines = translated_text.split('\n')
+            current_page = output_pdf.new_page(width=page_width, height=page_height)
+            y_position = 50
+            line_height = 14
+            margin = 50
+            
+            for line in lines:
+                if y_position > page_height - margin:
+                    # 새 페이지 생성
+                    current_page = output_pdf.new_page(width=page_width, height=page_height)
+                    y_position = 50
+                
+                # 텍스트 삽입
+                if line.strip():
+                    try:
+                        current_page.insert_text(
+                            fitz.Point(margin, y_position),
+                            line[:100],  # 긴 줄은 자르기
+                            fontsize=11,
+                            fontname="helv",
+                            color=(0, 0, 0)
+                        )
+                    except:
+                        pass
+                
+                y_position += line_height
+            
+            # PDF 저장
+            output_path = output_dir / self._create_output_filename(file_path, "text")
+            output_pdf.save(str(output_path))
+            
+            # 리소스 정리
+            output_pdf.close()
+            pdf_document.close()
+            
+            return {
+                'output_file': str(output_path),
+                'dual_file': None,
+                'format': 'pdf',
+                'pages': len(output_pdf),
+                'note': '텍스트 전용 번역 (레이아웃 미보존)'
+            }
+            
+        except Exception as e:
+            logger.error(f"폴백 PDF 번역 실패: {e}")
             raise
+    
+    def _split_text(self, text: str, max_length: int) -> List[str]:
+        """텍스트를 청크로 분할"""
+        chunks = []
+        current_chunk = ""
+        
+        sentences = text.split('. ')
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) < max_length:
+                current_chunk += sentence + '. '
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence + '. '
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+    
+    def _create_dual_pdf(self, original_path: Path, translated_path: Path, 
+                        output_dir: Path) -> Path:
+        """원문-번역 대조본 PDF 생성"""
+        try:
+            original_pdf = fitz.open(str(original_path))
+            translated_pdf = fitz.open(str(translated_path))
+            dual_pdf = fitz.open()
+            
+            # 각 페이지를 나란히 배치
+            for i in range(min(len(original_pdf), len(translated_pdf))):
+                orig_page = original_pdf[i]
+                trans_page = translated_pdf[i]
+                
+                # 두 페이지를 합친 크기의 새 페이지 생성
+                width = orig_page.rect.width + trans_page.rect.width
+                height = max(orig_page.rect.height, trans_page.rect.height)
+                
+                new_page = dual_pdf.new_page(width=width, height=height)
+                
+                # 원본 페이지 삽입 (왼쪽)
+                new_page.show_pdf_page(
+                    fitz.Rect(0, 0, orig_page.rect.width, height),
+                    original_pdf,
+                    i
+                )
+                
+                # 번역 페이지 삽입 (오른쪽)
+                new_page.show_pdf_page(
+                    fitz.Rect(orig_page.rect.width, 0, width, height),
+                    translated_pdf,
+                    i
+                )
+            
+            # 저장
+            dual_path = output_dir / self._create_output_filename(original_path, "dual")
+            dual_pdf.save(str(dual_path))
+            
+            # 리소스 정리
+            dual_pdf.close()
+            translated_pdf.close()
+            original_pdf.close()
+            
+            return dual_path
+            
+        except Exception as e:
+            logger.error(f"대조본 생성 실패: {e}")
+            return None
 
 
 class WordHandler(DocumentHandler):
@@ -361,14 +515,6 @@ class WordHandler(DocumentHandler):
                                     output_doc.sections[-1].footer.paragraphs[0].text = translated
                             except:
                                 pass
-            
-            # 이미지 내 텍스트 OCR (활성화된 경우)
-            if enable_ocr:
-                ocr = self._safe_get_ocr_engine()
-                if ocr:
-                    # Word 문서 내 이미지 처리
-                    # TODO: 구현 필요
-                    logger.info("Word 문서 내 이미지 OCR은 아직 구현되지 않았습니다.")
             
             # 파일 저장
             output_path = output_dir / self._create_output_filename(file_path)
@@ -722,14 +868,6 @@ class PowerPointHandler(DocumentHandler):
                                 output_slide.notes_slide.notes_text_frame.text = translated_notes
                         except Exception as e:
                             logger.warning(f"노트 번역 실패: {e}")
-            
-            # 이미지 내 텍스트 OCR (활성화된 경우)
-            if enable_ocr:
-                ocr = self._safe_get_ocr_engine()
-                if ocr:
-                    # PPT 내 이미지 처리
-                    # TODO: 구현 필요
-                    logger.info("PowerPoint 내 이미지 OCR은 아직 구현되지 않았습니다.")
             
             # 파일 저장
             output_path = output_dir / self._create_output_filename(file_path)
