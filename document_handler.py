@@ -2,7 +2,7 @@
 """
 문서 형식별 처리 모듈
 각 문서 형식에 대한 번역 처리를 담당합니다.
-Streamlit Cloud 호환 버전
+PDF 텍스트 뭉개짐 문제 해결 버전
 """
 
 import os
@@ -17,6 +17,8 @@ import re
 from datetime import datetime
 import tempfile
 import fitz  # PyMuPDF
+import io
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -79,234 +81,374 @@ class DocumentHandler(ABC):
 
 
 class PDFHandler(DocumentHandler):
-    """PDF 문서 처리기 - PyMuPDF 직접 사용"""
+    """개선된 PDF 문서 처리기 - 안정적인 텍스트 렌더링"""
+    
+    def __init__(self, translator):
+        super().__init__(translator)
+        # 언어별 텍스트 확장 비율
+        self.expansion_rates = {
+            ('en', 'ko'): 0.7,
+            ('ko', 'en'): 1.5,
+            ('ja', 'ko'): 0.9,
+            ('zh', 'ko'): 0.8,
+            ('ko', 'ja'): 1.1,
+            ('ko', 'zh'): 1.2,
+        }
     
     def translate(self, file_path: Path, source_lang: str, target_lang: str,
                  service: str, output_dir: Path, preserve_formatting: bool,
                  enable_ocr: bool, callback: Optional[callable] = None) -> Dict:
-        """PDF 번역 실행 - PyMuPDF 사용"""
+        """PDF 번역 실행 - 안정적인 방식"""
         logger.info(f"PDF 번역 시작: {file_path.name}")
         
+        # 메인 번역 시도
         try:
-            # PyMuPDF로 PDF 열기
-            pdf_document = fitz.open(str(file_path))
-            
-            # 새 PDF 생성
-            output_pdf = fitz.open()
-            
-            total_pages = len(pdf_document)
-            
+            return self._translate_with_overlay(
+                file_path, source_lang, target_lang, service, 
+                output_dir, preserve_formatting, callback
+            )
+        except Exception as e:
+            logger.warning(f"오버레이 방식 실패, 대체 방식 시도: {e}")
+            # 폴백: 새 PDF 생성 방식
+            return self._translate_with_new_pdf(
+                file_path, source_lang, target_lang, service, 
+                output_dir, callback
+            )
+    
+    def _translate_with_overlay(self, file_path: Path, source_lang: str, target_lang: str,
+                                service: str, output_dir: Path, preserve_formatting: bool,
+                                callback: Optional[callable] = None) -> Dict:
+        """오버레이 방식 번역 (원본 위에 덮어쓰기)"""
+        
+        pdf_document = fitz.open(str(file_path))
+        total_pages = len(pdf_document)
+        
+        try:
             for page_num in range(total_pages):
                 if callback:
                     callback(page_num + 1, total_pages, f"페이지 {page_num + 1}/{total_pages} 번역 중...")
                 
                 page = pdf_document[page_num]
                 
-                # 텍스트 추출
-                text_dict = page.get_text("dict")
+                # 텍스트 블록 추출
+                blocks = page.get_text("blocks")
                 
-                # 페이지 크기 가져오기
-                page_rect = page.rect
-                
-                # 새 페이지 생성
-                new_page = output_pdf.new_page(width=page_rect.width, height=page_rect.height)
-                
-                # 배경 이미지 복사 (있는 경우)
-                pix = page.get_pixmap(alpha=False)
-                img_data = pix.tobytes("png")
-                new_page.insert_image(page_rect, stream=img_data)
-                
-                # 텍스트 블록 번역 및 삽입
-                for block in text_dict["blocks"]:
-                    if block["type"] == 0:  # 텍스트 블록
-                        for line in block["lines"]:
-                            for span in line["spans"]:
-                                original_text = span["text"]
+                # 텍스트 블록을 뒤에서부터 처리 (레이어 순서 유지)
+                for block in reversed(blocks):
+                    if block[6] == 0:  # 텍스트 블록인 경우
+                        bbox = fitz.Rect(block[:4])
+                        original_text = block[4].strip()
+                        
+                        if self._should_translate(original_text):
+                            try:
+                                # 텍스트 번역
+                                translated_text = self.translator.translate_text(
+                                    original_text, source_lang, target_lang, service
+                                )
                                 
-                                if self._should_translate(original_text):
-                                    try:
-                                        # 텍스트 번역
-                                        translated_text = self.translator.translate_text(
-                                            original_text, source_lang, target_lang, service
-                                        )
-                                        
-                                        # 번역된 텍스트 삽입
-                                        font_size = span["size"]
-                                        flags = span["flags"]
-                                        
-                                        # 기존 텍스트 영역에 흰색 사각형 그리기 (텍스트 지우기)
-                                        bbox = span["bbox"]
-                                        rect = fitz.Rect(bbox)
-                                        new_page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1))
-                                        
-                                        # 번역된 텍스트 삽입
-                                        point = fitz.Point(bbox[0], bbox[3] - 2)  # 좌하단 기준
-                                        
-                                        # 폰트 설정
-                                        fontname = "helv"  # 기본 폰트
-                                        if "font" in span:
-                                            if "cjk" in span["font"].lower() or "korean" in span["font"].lower():
-                                                fontname = "china-s"  # CJK 폰트
-                                        
-                                        try:
-                                            new_page.insert_text(
-                                                point,
-                                                translated_text,
-                                                fontsize=font_size,
-                                                fontname=fontname,
-                                                color=(0, 0, 0)
-                                            )
-                                        except:
-                                            # 폰트 오류 시 기본 폰트 사용
-                                            new_page.insert_text(
-                                                point,
-                                                translated_text,
-                                                fontsize=font_size,
-                                                fontname="helv",
-                                                color=(0, 0, 0)
-                                            )
-                                    
-                                    except Exception as e:
-                                        logger.warning(f"텍스트 번역 실패: {e}")
-                                        # 원본 텍스트 유지
-                                        point = fitz.Point(span["bbox"][0], span["bbox"][3] - 2)
-                                        new_page.insert_text(
-                                            point,
-                                            original_text,
-                                            fontsize=span["size"],
-                                            color=(0, 0, 0)
-                                        )
+                                # 기존 텍스트 영역을 흰색으로 덮기
+                                page.draw_rect(bbox, color=None, fill=(1, 1, 1))
+                                
+                                # 번역된 텍스트 삽입
+                                self._insert_text_safe(
+                                    page, bbox, translated_text, 
+                                    source_lang, target_lang
+                                )
+                                
+                            except Exception as e:
+                                logger.debug(f"블록 번역 실패, 건너뜀: {e}")
+                                continue
             
-            # PDF 저장
+            # 저장
             output_path = output_dir / self._create_output_filename(file_path)
-            output_pdf.save(str(output_path))
-            
-            # 리소스 정리
-            output_pdf.close()
+            pdf_document.save(str(output_path), garbage=3, deflate=True)
             pdf_document.close()
-            
-            # 대조본 생성 (선택사항)
-            dual_path = None
-            if preserve_formatting:
-                try:
-                    dual_path = self._create_dual_pdf(file_path, output_path, output_dir)
-                except Exception as e:
-                    logger.warning(f"대조본 생성 실패: {e}")
             
             return {
                 'output_file': str(output_path),
-                'dual_file': str(dual_path) if dual_path else None,
                 'format': 'pdf',
                 'pages': total_pages
             }
             
         except Exception as e:
-            logger.error(f"PDF 번역 실패: {e}")
-            
-            # 폴백: 간단한 텍스트 추출 및 번역
-            try:
-                return self._fallback_pdf_translation(
-                    file_path, source_lang, target_lang, service, output_dir
-                )
-            except Exception as fallback_error:
-                logger.error(f"폴백 번역도 실패: {fallback_error}")
-                raise
+            pdf_document.close()
+            raise e
     
-    def _fallback_pdf_translation(self, file_path: Path, source_lang: str, 
-                                 target_lang: str, service: str, output_dir: Path) -> Dict:
-        """폴백: 단순 텍스트 추출 후 새 PDF 생성"""
-        logger.info("폴백 PDF 번역 모드 사용")
+    def _translate_with_new_pdf(self, file_path: Path, source_lang: str, target_lang: str,
+                               service: str, output_dir: Path, 
+                               callback: Optional[callable] = None) -> Dict:
+        """새 PDF 생성 방식 (더 안전하지만 레이아웃 단순)"""
+        logger.info("새 PDF 생성 방식으로 번역")
+        
+        pdf_document = fitz.open(str(file_path))
+        output_pdf = fitz.open()
+        total_pages = len(pdf_document)
         
         try:
-            # PDF에서 텍스트 추출
-            pdf_document = fitz.open(str(file_path))
-            
-            # 텍스트 수집
-            all_text = []
-            for page_num in range(len(pdf_document)):
+            for page_num in range(total_pages):
+                if callback:
+                    callback(page_num + 1, total_pages, f"페이지 {page_num + 1}/{total_pages} 처리 중...")
+                
                 page = pdf_document[page_num]
-                text = page.get_text()
-                if text.strip():
-                    all_text.append(f"[Page {page_num + 1}]\n{text}")
-            
-            full_text = "\n\n".join(all_text)
-            
-            # 전체 텍스트 번역
-            translated_text = ""
-            if full_text:
-                # 텍스트를 청크로 분할 (너무 길면 API 제한에 걸릴 수 있음)
-                chunks = self._split_text(full_text, 3000)
-                translated_chunks = []
                 
-                for chunk in chunks:
-                    if self._should_translate(chunk):
-                        try:
-                            translated_chunk = self.translator.translate_text(
-                                chunk, source_lang, target_lang, service
-                            )
-                            translated_chunks.append(translated_chunk)
-                        except Exception as e:
-                            logger.warning(f"청크 번역 실패: {e}")
-                            translated_chunks.append(chunk)
-                    else:
-                        translated_chunks.append(chunk)
+                # 페이지 이미지로 변환 (배경 유지)
+                mat = fitz.Matrix(2, 2)  # 2배 해상도
+                pix = page.get_pixmap(matrix=mat, alpha=False)
                 
-                translated_text = "\n\n".join(translated_chunks)
-            
-            # 새 PDF 생성 (텍스트만)
-            output_pdf = fitz.open()
-            
-            # A4 크기 페이지 생성
-            page_width = 595  # A4 width in points
-            page_height = 842  # A4 height in points
-            
-            # 텍스트를 페이지에 맞게 분할
-            lines = translated_text.split('\n')
-            current_page = output_pdf.new_page(width=page_width, height=page_height)
-            y_position = 50
-            line_height = 14
-            margin = 50
-            
-            for line in lines:
-                if y_position > page_height - margin:
-                    # 새 페이지 생성
-                    current_page = output_pdf.new_page(width=page_width, height=page_height)
-                    y_position = 50
+                # 새 페이지 생성
+                new_page = output_pdf.new_page(
+                    width=page.rect.width,
+                    height=page.rect.height
+                )
                 
-                # 텍스트 삽입
-                if line.strip():
-                    try:
-                        current_page.insert_text(
-                            fitz.Point(margin, y_position),
-                            line[:100],  # 긴 줄은 자르기
-                            fontsize=11,
-                            fontname="helv",
-                            color=(0, 0, 0)
+                # 배경 이미지 삽입
+                img_data = pix.tobytes("png")
+                img_rect = new_page.rect
+                new_page.insert_image(img_rect, stream=img_data)
+                
+                # 텍스트 추출 및 번역
+                text_page = page.get_textpage()
+                blocks = page.get_text("dict", textpage=text_page)
+                
+                # 각 텍스트 블록 처리
+                for block in blocks["blocks"]:
+                    if block["type"] == 0:  # 텍스트 블록
+                        self._process_text_block(
+                            new_page, block, source_lang, target_lang, service
                         )
-                    except:
-                        pass
-                
-                y_position += line_height
             
-            # PDF 저장
-            output_path = output_dir / self._create_output_filename(file_path, "text")
+            # 저장
+            output_path = output_dir / self._create_output_filename(file_path)
             output_pdf.save(str(output_path))
-            
-            # 리소스 정리
             output_pdf.close()
             pdf_document.close()
             
             return {
                 'output_file': str(output_path),
-                'dual_file': None,
                 'format': 'pdf',
-                'pages': len(output_pdf),
-                'note': '텍스트 전용 번역 (레이아웃 미보존)'
+                'pages': total_pages,
+                'note': '새 PDF 생성 방식 사용'
             }
             
         except Exception as e:
-            logger.error(f"폴백 PDF 번역 실패: {e}")
-            raise
+            output_pdf.close()
+            pdf_document.close()
+            logger.error(f"새 PDF 생성 실패: {e}")
+            raise e
+    
+    def _process_text_block(self, page, block: Dict, source_lang: str, 
+                          target_lang: str, service: str):
+        """텍스트 블록 처리"""
+        try:
+            # 블록의 전체 텍스트 수집
+            block_text = ""
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    block_text += span["text"]
+                block_text += " "
+            
+            block_text = block_text.strip()
+            
+            if not self._should_translate(block_text):
+                return
+            
+            # 번역
+            translated_text = self.translator.translate_text(
+                block_text, source_lang, target_lang, service
+            )
+            
+            # 원본 영역에 흰색 사각형 그리기
+            bbox = block["bbox"]
+            rect = fitz.Rect(bbox)
+            
+            # 흰색 배경
+            shape = page.new_shape()
+            shape.draw_rect(rect)
+            shape.finish(color=None, fill=(1, 1, 1))
+            shape.commit()
+            
+            # 번역된 텍스트 삽입
+            self._insert_text_with_wrap(
+                page, rect, translated_text, 
+                block.get("lines", []), target_lang
+            )
+            
+        except Exception as e:
+            logger.debug(f"텍스트 블록 처리 실패: {e}")
+    
+    def _insert_text_safe(self, page, rect: fitz.Rect, text: str, 
+                         source_lang: str, target_lang: str):
+        """안전한 텍스트 삽입"""
+        try:
+            # 텍스트 확장률 계산
+            expansion_key = (source_lang, target_lang)
+            expansion_rate = self.expansion_rates.get(expansion_key, 1.0)
+            
+            # 기본 폰트 크기 계산
+            base_font_size = min(12, rect.height / 2)
+            
+            # 확장률에 따른 폰트 크기 조정
+            if expansion_rate > 1.2:
+                font_size = base_font_size * 0.7
+            elif expansion_rate < 0.8:
+                font_size = base_font_size * 1.1
+            else:
+                font_size = base_font_size
+            
+            # 최소/최대 크기 제한
+            font_size = max(6, min(font_size, 16))
+            
+            # 텍스트 래핑
+            wrapped_lines = self._wrap_text(text, rect.width, font_size)
+            
+            # 텍스트 삽입 위치 계산
+            x = rect.x0 + 2
+            y = rect.y0 + font_size
+            line_height = font_size * 1.2
+            
+            # 사용 가능한 폰트 찾기
+            fontname = self._get_best_font(target_lang)
+            
+            # 각 줄 삽입
+            for i, line in enumerate(wrapped_lines):
+                if y + (i * line_height) > rect.y1 - 2:
+                    break  # 영역을 벗어나면 중단
+                
+                try:
+                    page.insert_text(
+                        (x, y + (i * line_height)),
+                        line,
+                        fontsize=font_size,
+                        fontname=fontname,
+                        color=(0, 0, 0),
+                        render_mode=0  # fill
+                    )
+                except:
+                    # 폰트 오류 시 기본 폰트 사용
+                    page.insert_text(
+                        (x, y + (i * line_height)),
+                        line,
+                        fontsize=font_size,
+                        color=(0, 0, 0)
+                    )
+                    
+        except Exception as e:
+            logger.debug(f"텍스트 삽입 실패: {e}")
+            # 최후의 수단: 단순 텍스트 삽입
+            try:
+                page.insert_text(
+                    (rect.x0, rect.y0 + 10),
+                    text[:50],  # 처음 50자만
+                    fontsize=8,
+                    color=(0, 0, 0)
+                )
+            except:
+                pass
+    
+    def _insert_text_with_wrap(self, page, rect: fitz.Rect, text: str, 
+                              original_lines: List, target_lang: str):
+        """텍스트 래핑과 함께 삽입"""
+        try:
+            # 원본 스타일 정보 추출
+            font_size = 10  # 기본값
+            if original_lines and len(original_lines) > 0:
+                if "spans" in original_lines[0] and len(original_lines[0]["spans"]) > 0:
+                    font_size = original_lines[0]["spans"][0].get("size", 10)
+            
+            # 텍스트 길이에 따른 폰트 크기 조정
+            text_length = len(text)
+            if text_length > 100:
+                font_size = font_size * 0.8
+            elif text_length > 200:
+                font_size = font_size * 0.6
+            
+            font_size = max(6, min(font_size, 14))
+            
+            # 텍스트 래핑
+            lines = self._wrap_text(text, rect.width - 4, font_size)
+            
+            # 폰트 선택
+            fontname = self._get_best_font(target_lang)
+            
+            # 텍스트 삽입
+            x = rect.x0 + 2
+            y = rect.y0 + font_size
+            line_height = font_size * 1.2
+            
+            for i, line in enumerate(lines):
+                if y + (i * line_height) > rect.y1:
+                    break
+                
+                try:
+                    text_inst = page.insert_text(
+                        (x, y + (i * line_height)),
+                        line,
+                        fontsize=font_size,
+                        fontname=fontname,
+                        color=(0, 0, 0)
+                    )
+                except Exception as e:
+                    # 기본 폰트로 재시도
+                    try:
+                        page.insert_text(
+                            (x, y + (i * line_height)),
+                            line,
+                            fontsize=font_size,
+                            color=(0, 0, 0)
+                        )
+                    except:
+                        pass
+                        
+        except Exception as e:
+            logger.debug(f"래핑 텍스트 삽입 실패: {e}")
+    
+    def _wrap_text(self, text: str, max_width: float, font_size: float) -> List[str]:
+        """텍스트 래핑"""
+        # 대략적인 문자당 너비 계산
+        char_width = font_size * 0.5  # 평균적인 문자 너비
+        chars_per_line = int(max_width / char_width)
+        
+        if chars_per_line <= 0:
+            return [text]
+        
+        # 단어 단위로 분할
+        words = text.split()
+        lines = []
+        current_line = []
+        current_length = 0
+        
+        for word in words:
+            word_length = len(word)
+            
+            if current_length + word_length + 1 <= chars_per_line:
+                current_line.append(word)
+                current_length += word_length + 1
+            else:
+                if current_line:
+                    lines.append(' '.join(current_line))
+                current_line = [word]
+                current_length = word_length
+        
+        if current_line:
+            lines.append(' '.join(current_line))
+        
+        return lines if lines else [text]
+    
+    def _get_best_font(self, language: str) -> str:
+        """언어에 맞는 최적 폰트 선택"""
+        # PyMuPDF 기본 폰트
+        font_map = {
+            'ko': 'china-s',   # CJK 폰트 (한글 지원)
+            'ja': 'japan',     # 일본어
+            'zh': 'china-s',   # 중국어 간체
+            'zh-TW': 'china-t', # 중국어 번체  
+            'ar': 'arab',      # 아랍어
+            'hi': 'deva',      # 힌디어
+            'ru': 'cour',      # 키릴 문자
+        }
+        
+        # 폰트가 없으면 기본 폰트 사용
+        return font_map.get(language, 'helv')
     
     def _split_text(self, text: str, max_length: int) -> List[str]:
         """텍스트를 청크로 분할"""
@@ -326,54 +468,6 @@ class PDFHandler(DocumentHandler):
             chunks.append(current_chunk.strip())
         
         return chunks
-    
-    def _create_dual_pdf(self, original_path: Path, translated_path: Path, 
-                        output_dir: Path) -> Path:
-        """원문-번역 대조본 PDF 생성"""
-        try:
-            original_pdf = fitz.open(str(original_path))
-            translated_pdf = fitz.open(str(translated_path))
-            dual_pdf = fitz.open()
-            
-            # 각 페이지를 나란히 배치
-            for i in range(min(len(original_pdf), len(translated_pdf))):
-                orig_page = original_pdf[i]
-                trans_page = translated_pdf[i]
-                
-                # 두 페이지를 합친 크기의 새 페이지 생성
-                width = orig_page.rect.width + trans_page.rect.width
-                height = max(orig_page.rect.height, trans_page.rect.height)
-                
-                new_page = dual_pdf.new_page(width=width, height=height)
-                
-                # 원본 페이지 삽입 (왼쪽)
-                new_page.show_pdf_page(
-                    fitz.Rect(0, 0, orig_page.rect.width, height),
-                    original_pdf,
-                    i
-                )
-                
-                # 번역 페이지 삽입 (오른쪽)
-                new_page.show_pdf_page(
-                    fitz.Rect(orig_page.rect.width, 0, width, height),
-                    translated_pdf,
-                    i
-                )
-            
-            # 저장
-            dual_path = output_dir / self._create_output_filename(original_path, "dual")
-            dual_pdf.save(str(dual_path))
-            
-            # 리소스 정리
-            dual_pdf.close()
-            translated_pdf.close()
-            original_pdf.close()
-            
-            return dual_path
-            
-        except Exception as e:
-            logger.error(f"대조본 생성 실패: {e}")
-            return None
 
 
 class WordHandler(DocumentHandler):
@@ -388,7 +482,6 @@ class WordHandler(DocumentHandler):
         try:
             from docx import Document
             from docx.shared import RGBColor, Pt
-            from docx.enum.text import WD_COLOR_INDEX
             
             # 문서 열기
             doc = Document(str(file_path))
@@ -396,8 +489,11 @@ class WordHandler(DocumentHandler):
             
             # 문서 속성 복사
             if preserve_formatting:
-                output_doc.core_properties.author = doc.core_properties.author
-                output_doc.core_properties.title = doc.core_properties.title
+                try:
+                    output_doc.core_properties.author = doc.core_properties.author
+                    output_doc.core_properties.title = doc.core_properties.title
+                except:
+                    pass
             
             total_items = len(doc.paragraphs) + sum(len(table.rows) * len(table.columns) for table in doc.tables)
             processed_items = 0
@@ -418,12 +514,15 @@ class WordHandler(DocumentHandler):
                 
                 # 서식 복사
                 if preserve_formatting:
-                    new_para.alignment = paragraph.alignment
-                    new_para.paragraph_format.space_before = paragraph.paragraph_format.space_before
-                    new_para.paragraph_format.space_after = paragraph.paragraph_format.space_after
-                    new_para.paragraph_format.line_spacing = paragraph.paragraph_format.line_spacing
+                    try:
+                        new_para.alignment = paragraph.alignment
+                        new_para.paragraph_format.space_before = paragraph.paragraph_format.space_before
+                        new_para.paragraph_format.space_after = paragraph.paragraph_format.space_after
+                        new_para.paragraph_format.line_spacing = paragraph.paragraph_format.line_spacing
+                    except:
+                        pass
                 
-                # Run 단위로 번역 (서식 보존)
+                # Run 단위로 번역
                 for run in paragraph.runs:
                     if self._should_translate(run.text):
                         try:
@@ -441,18 +540,19 @@ class WordHandler(DocumentHandler):
                     
                     # 서식 복사
                     if preserve_formatting:
-                        if run.bold is not None:
-                            new_run.bold = run.bold
-                        if run.italic is not None:
-                            new_run.italic = run.italic
-                        if run.underline:
-                            new_run.underline = run.underline
-                        if run.font.size:
-                            new_run.font.size = run.font.size
-                        if run.font.name:
-                            new_run.font.name = run.font.name
-                        if run.font.color.rgb:
-                            new_run.font.color.rgb = run.font.color.rgb
+                        try:
+                            if run.bold is not None:
+                                new_run.bold = run.bold
+                            if run.italic is not None:
+                                new_run.italic = run.italic
+                            if run.underline:
+                                new_run.underline = run.underline
+                            if run.font.size:
+                                new_run.font.size = run.font.size
+                            if run.font.name:
+                                new_run.font.name = run.font.name
+                        except:
+                            pass
             
             # 표 번역
             for table_idx, table in enumerate(doc.tables):
@@ -464,7 +564,10 @@ class WordHandler(DocumentHandler):
                 
                 # 표 스타일 복사
                 if preserve_formatting and table.style:
-                    new_table.style = table.style
+                    try:
+                        new_table.style = table.style
+                    except:
+                        pass
                 
                 # 셀 번역
                 for row_idx, row in enumerate(table.rows):
@@ -487,46 +590,12 @@ class WordHandler(DocumentHandler):
                         else:
                             new_cell.text = cell_text
             
-            # 헤더/푸터 번역
-            for section in doc.sections:
-                # 헤더
-                if section.header:
-                    for paragraph in section.header.paragraphs:
-                        if self._should_translate(paragraph.text):
-                            try:
-                                translated = self.translator.translate_text(
-                                    paragraph.text, source_lang, target_lang, service
-                                )
-                                # 새 섹션에 헤더 추가
-                                if output_doc.sections:
-                                    output_doc.sections[-1].header.paragraphs[0].text = translated
-                            except:
-                                pass
-                
-                # 푸터
-                if section.footer:
-                    for paragraph in section.footer.paragraphs:
-                        if self._should_translate(paragraph.text):
-                            try:
-                                translated = self.translator.translate_text(
-                                    paragraph.text, source_lang, target_lang, service
-                                )
-                                if output_doc.sections:
-                                    output_doc.sections[-1].footer.paragraphs[0].text = translated
-                            except:
-                                pass
-            
             # 파일 저장
             output_path = output_dir / self._create_output_filename(file_path)
             output_doc.save(str(output_path))
             
-            # 대조본 생성 (원본 + 번역)
-            dual_path = output_dir / self._create_output_filename(file_path, "dual")
-            self._create_word_dual(doc, output_doc, dual_path)
-            
             return {
                 'output_file': str(output_path),
-                'dual_file': str(dual_path),
                 'format': 'docx',
                 'paragraphs': len(doc.paragraphs),
                 'tables': len(doc.tables)
@@ -535,36 +604,6 @@ class WordHandler(DocumentHandler):
         except Exception as e:
             logger.error(f"Word 번역 실패: {e}")
             raise
-    
-    def _create_word_dual(self, original_doc, translated_doc, output_path: Path):
-        """원문-번역 대조본 생성"""
-        try:
-            from docx import Document
-            
-            dual_doc = Document()
-            dual_doc.add_heading('원문-번역 대조본', 0)
-            dual_doc.add_paragraph(f'생성일: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
-            dual_doc.add_page_break()
-            
-            # 단락별 대조
-            for orig_para, trans_para in zip(original_doc.paragraphs, translated_doc.paragraphs):
-                if orig_para.text.strip():
-                    # 원문
-                    p1 = dual_doc.add_paragraph()
-                    p1.add_run('[원문] ').bold = True
-                    p1.add_run(orig_para.text)
-                    
-                    # 번역
-                    p2 = dual_doc.add_paragraph()
-                    p2.add_run('[번역] ').bold = True
-                    p2.add_run(trans_para.text)
-                    
-                    dual_doc.add_paragraph()  # 빈 줄
-            
-            dual_doc.save(str(output_path))
-            
-        except Exception as e:
-            logger.warning(f"대조본 생성 실패: {e}")
 
 
 class ExcelHandler(DocumentHandler):
@@ -578,8 +617,7 @@ class ExcelHandler(DocumentHandler):
         
         try:
             from openpyxl import load_workbook, Workbook
-            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-            from openpyxl.utils import get_column_letter
+            from openpyxl.styles import Font, PatternFill, Alignment
             
             # 워크북 열기
             wb = load_workbook(str(file_path), data_only=False)
@@ -644,67 +682,49 @@ class ExcelHandler(DocumentHandler):
                         
                         # 서식 복사
                         if preserve_formatting:
-                            # 폰트
-                            if cell.font:
-                                output_cell.font = Font(
-                                    name=cell.font.name,
-                                    size=cell.font.size,
-                                    bold=cell.font.bold,
-                                    italic=cell.font.italic,
-                                    color=cell.font.color
-                                )
-                            
-                            # 배경색
-                            if cell.fill:
-                                output_cell.fill = PatternFill(
-                                    fill_type=cell.fill.fill_type,
-                                    start_color=cell.fill.start_color,
-                                    end_color=cell.fill.end_color
-                                )
-                            
-                            # 정렬
-                            if cell.alignment:
-                                output_cell.alignment = Alignment(
-                                    horizontal=cell.alignment.horizontal,
-                                    vertical=cell.alignment.vertical,
-                                    wrap_text=cell.alignment.wrap_text
-                                )
-                            
-                            # 테두리
-                            if cell.border:
-                                output_cell.border = cell.border
-                            
-                            # 숫자 서식
-                            if cell.number_format:
-                                output_cell.number_format = cell.number_format
+                            try:
+                                # 폰트
+                                if cell.font:
+                                    output_cell.font = Font(
+                                        name=cell.font.name,
+                                        size=cell.font.size,
+                                        bold=cell.font.bold,
+                                        italic=cell.font.italic,
+                                        color=cell.font.color
+                                    )
+                                
+                                # 배경색
+                                if cell.fill:
+                                    output_cell.fill = PatternFill(
+                                        fill_type=cell.fill.fill_type,
+                                        start_color=cell.fill.start_color,
+                                        end_color=cell.fill.end_color
+                                    )
+                                
+                                # 정렬
+                                if cell.alignment:
+                                    output_cell.alignment = Alignment(
+                                        horizontal=cell.alignment.horizontal,
+                                        vertical=cell.alignment.vertical,
+                                        wrap_text=cell.alignment.wrap_text
+                                    )
+                                
+                                # 숫자 서식
+                                if cell.number_format:
+                                    output_cell.number_format = cell.number_format
+                            except:
+                                pass
                 
                 # 병합 셀 처리
                 for merged_range in ws.merged_cells.ranges:
                     output_ws.merge_cells(str(merged_range))
-                
-                # 차트 제목 번역
-                for chart in ws._charts:
-                    if chart.title and self._should_translate(str(chart.title)):
-                        try:
-                            translated_title = self.translator.translate_text(
-                                str(chart.title), source_lang, target_lang, service
-                            )
-                            # 차트는 복사가 복잡하므로 제목만 번역
-                            logger.info(f"차트 제목 번역: {chart.title} → {translated_title}")
-                        except:
-                            pass
             
             # 파일 저장
             output_path = output_dir / self._create_output_filename(file_path)
             output_wb.save(str(output_path))
             
-            # 주석 추가본 생성
-            annotated_path = output_dir / self._create_output_filename(file_path, "annotated")
-            self._create_excel_annotated(wb, output_wb, annotated_path)
-            
             return {
                 'output_file': str(output_path),
-                'annotated_file': str(annotated_path),
                 'format': 'xlsx',
                 'sheets': len(wb.worksheets),
                 'total_cells': processed_cells
@@ -713,35 +733,6 @@ class ExcelHandler(DocumentHandler):
         except Exception as e:
             logger.error(f"Excel 번역 실패: {e}")
             raise
-    
-    def _create_excel_annotated(self, original_wb, translated_wb, output_path: Path):
-        """주석이 추가된 버전 생성 (원문을 주석으로)"""
-        try:
-            from openpyxl.comments import Comment
-            from openpyxl import load_workbook
-            
-            # 번역본 복사
-            translated_wb.save(str(output_path))
-            annotated_wb = load_workbook(str(output_path))
-            
-            # 각 시트별로 주석 추가
-            for orig_ws, anno_ws in zip(original_wb.worksheets, annotated_wb.worksheets):
-                for row in range(1, min(orig_ws.max_row + 1, 100)):  # 최대 100행
-                    for col in range(1, min(orig_ws.max_column + 1, 20)):  # 최대 20열
-                        orig_cell = orig_ws.cell(row=row, column=col)
-                        anno_cell = anno_ws.cell(row=row, column=col)
-                        
-                        # 원문이 있고 번역된 경우 주석 추가
-                        if (orig_cell.value and 
-                            isinstance(orig_cell.value, str) and 
-                            anno_cell.value != orig_cell.value):
-                            comment = Comment(f"원문: {orig_cell.value}", "Translator")
-                            anno_cell.comment = comment
-            
-            annotated_wb.save(str(output_path))
-            
-        except Exception as e:
-            logger.warning(f"주석 추가본 생성 실패: {e}")
 
 
 class PowerPointHandler(DocumentHandler):
@@ -756,7 +747,6 @@ class PowerPointHandler(DocumentHandler):
         try:
             from pptx import Presentation
             from pptx.util import Inches, Pt
-            from pptx.enum.text import PP_ALIGN
             
             # 프레젠테이션 열기
             prs = Presentation(str(file_path))
@@ -766,10 +756,7 @@ class PowerPointHandler(DocumentHandler):
             output_prs.slide_width = prs.slide_width
             output_prs.slide_height = prs.slide_height
             
-            total_items = sum(
-                len(slide.shapes) + len(getattr(slide, 'notes_slide', []))
-                for slide in prs.slides
-            )
+            total_items = sum(len(slide.shapes) for slide in prs.slides)
             processed_items = 0
             
             # 슬라이드별 처리
@@ -808,17 +795,20 @@ class PowerPointHandler(DocumentHandler):
                                     
                                     # 서식 복사
                                     if preserve_formatting and paragraph.runs:
-                                        run = paragraph.runs[0]
-                                        output_run = output_para.runs[0] if output_para.runs else output_para.add_run()
-                                        
-                                        if run.font.name:
-                                            output_run.font.name = run.font.name
-                                        if run.font.size:
-                                            output_run.font.size = run.font.size
-                                        if run.font.bold is not None:
-                                            output_run.font.bold = run.font.bold
-                                        if run.font.italic is not None:
-                                            output_run.font.italic = run.font.italic
+                                        try:
+                                            run = paragraph.runs[0]
+                                            output_run = output_para.runs[0] if output_para.runs else output_para.add_run()
+                                            
+                                            if run.font.name:
+                                                output_run.font.name = run.font.name
+                                            if run.font.size:
+                                                output_run.font.size = run.font.size
+                                            if run.font.bold is not None:
+                                                output_run.font.bold = run.font.bold
+                                            if run.font.italic is not None:
+                                                output_run.font.italic = run.font.italic
+                                        except:
+                                            pass
                                     
                                 except Exception as e:
                                     logger.warning(f"텍스트 번역 실패: {e}")
@@ -839,35 +829,6 @@ class PowerPointHandler(DocumentHandler):
                                         cell.text = translated
                                     except:
                                         pass
-                    
-                    # 차트가 있는 경우
-                    elif shape.has_chart:
-                        chart = shape.chart
-                        # 차트 제목 번역
-                        if chart.has_title and self._should_translate(chart.chart_title.text_frame.text):
-                            try:
-                                translated = self.translator.translate_text(
-                                    chart.chart_title.text_frame.text,
-                                    source_lang, target_lang, service
-                                )
-                                # 차트는 복사가 복잡하므로 로그만
-                                logger.info(f"차트 제목: {chart.chart_title.text_frame.text} → {translated}")
-                            except:
-                                pass
-                
-                # 발표자 노트 번역
-                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
-                    notes_text = slide.notes_slide.notes_text_frame.text
-                    if self._should_translate(notes_text):
-                        try:
-                            translated_notes = self.translator.translate_text(
-                                notes_text, source_lang, target_lang, service
-                            )
-                            # 노트 추가
-                            if output_slide.has_notes_slide:
-                                output_slide.notes_slide.notes_text_frame.text = translated_notes
-                        except Exception as e:
-                            logger.warning(f"노트 번역 실패: {e}")
             
             # 파일 저장
             output_path = output_dir / self._create_output_filename(file_path)
@@ -947,13 +908,8 @@ class TextHandler(DocumentHandler):
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(translated_content)
             
-            # 대조본 생성
-            dual_path = output_dir / self._create_output_filename(file_path, "dual")
-            self._create_text_dual(content, translated_content, dual_path)
-            
             return {
                 'output_file': str(output_path),
-                'dual_file': str(dual_path),
                 'format': file_path.suffix[1:],
                 'lines': len(content.split('\n')),
                 'characters': len(content)
@@ -988,29 +944,6 @@ class TextHandler(DocumentHandler):
         
         content = re.sub(inline_pattern, save_inline_code, content)
         
-        # 링크 URL 보호
-        links = []
-        link_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
-        
-        def process_link(match):
-            text = match.group(1)
-            url = match.group(2)
-            links.append(url)
-            
-            # 링크 텍스트만 번역
-            if self._should_translate(text):
-                try:
-                    translated_text = self.translator.translate_text(
-                        text, source_lang, target_lang, service
-                    )
-                    return f"[{translated_text}](__LINK_{len(links)-1}__)"
-                except:
-                    return f"[{text}](__LINK_{len(links)-1}__)"
-            else:
-                return f"[{text}](__LINK_{len(links)-1}__)"
-        
-        content = re.sub(link_pattern, process_link, content)
-        
         # 줄별 번역
         lines = content.split('\n')
         translated_lines = []
@@ -1039,24 +972,6 @@ class TextHandler(DocumentHandler):
                     translated_lines.append(line)
                 continue
             
-            # 리스트 항목 처리
-            list_match = re.match(r'^(\s*[-*+]|\s*\d+\.)\s+(.+)', line)
-            if list_match:
-                prefix = list_match.group(1)
-                text = list_match.group(2)
-                
-                if self._should_translate(text):
-                    try:
-                        translated_text = self.translator.translate_text(
-                            text, source_lang, target_lang, service
-                        )
-                        translated_lines.append(f"{prefix} {translated_text}")
-                    except:
-                        translated_lines.append(line)
-                else:
-                    translated_lines.append(line)
-                continue
-            
             # 일반 텍스트
             if self._should_translate(line):
                 try:
@@ -1073,47 +988,10 @@ class TextHandler(DocumentHandler):
         translated_content = '\n'.join(translated_lines)
         
         # 보호된 요소 복원
-        # 링크 복원
-        for idx, url in enumerate(links):
-            translated_content = translated_content.replace(f"__LINK_{idx}__", url)
-        
-        # 인라인 코드 복원
         for idx, code in enumerate(inline_codes):
             translated_content = translated_content.replace(f"__INLINE_CODE_{idx}__", code)
         
-        # 코드 블록 복원
         for idx, block in enumerate(code_blocks):
             translated_content = translated_content.replace(f"__CODE_BLOCK_{idx}__", block)
         
         return translated_content
-    
-    def _create_text_dual(self, original: str, translated: str, output_path: Path):
-        """텍스트 대조본 생성"""
-        try:
-            orig_lines = original.split('\n')
-            trans_lines = translated.split('\n')
-            
-            dual_content = []
-            dual_content.append("=" * 50)
-            dual_content.append("원문-번역 대조본")
-            dual_content.append(f"생성일: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            dual_content.append("=" * 50)
-            dual_content.append("")
-            
-            # 줄별 대조
-            max_lines = max(len(orig_lines), len(trans_lines))
-            for i in range(max_lines):
-                if i < len(orig_lines) and orig_lines[i].strip():
-                    dual_content.append(f"[원문] {orig_lines[i]}")
-                    
-                if i < len(trans_lines) and trans_lines[i].strip():
-                    dual_content.append(f"[번역] {trans_lines[i]}")
-                
-                dual_content.append("")  # 빈 줄
-            
-            # 파일 저장
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(dual_content))
-                
-        except Exception as e:
-            logger.warning(f"대조본 생성 실패: {e}")
