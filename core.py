@@ -2,6 +2,7 @@
 """
 통합 문서 번역기 핵심 모듈
 모든 문서 형식의 번역을 관리합니다.
+Google Translate 호환성 문제 해결 버전
 """
 
 import os
@@ -205,39 +206,83 @@ Text to translate:
 
 
 class GoogleTranslationService(TranslationService):
-    """Google 번역 서비스 (무료)"""
+    """Google 번역 서비스 (무료) - deep-translator 사용"""
     
     def translate_text(self, text: str, source_lang: str, target_lang: str) -> str:
-        """Google Translate API 사용"""
+        """Google Translate API 사용 (deep-translator 라이브러리)"""
         if not text.strip():
             return text
             
         try:
-            from googletrans import Translator
-            translator = Translator()
+            from deep_translator import GoogleTranslator
             
-            result = translator.translate(text, src=source_lang, dest=target_lang)
-            return result.text
+            # 언어 코드 매핑 (필요한 경우)
+            lang_map = {
+                'zh-TW': 'zh-TW',  # Traditional Chinese
+                'auto': 'auto'
+            }
             
+            source = lang_map.get(source_lang, source_lang)
+            target = lang_map.get(target_lang, target_lang)
+            
+            # auto 감지인 경우
+            if source == 'auto':
+                translator = GoogleTranslator(source='auto', target=target)
+            else:
+                translator = GoogleTranslator(source=source, target=target)
+            
+            # 텍스트가 너무 긴 경우 분할 처리
+            max_length = 5000
+            if len(text) > max_length:
+                # 문장 단위로 분할
+                import re
+                sentences = re.split(r'(?<=[.!?])\s+', text)
+                
+                translated_parts = []
+                current_chunk = ""
+                
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) < max_length:
+                        current_chunk += sentence + " "
+                    else:
+                        if current_chunk:
+                            translated_parts.append(translator.translate(current_chunk.strip()))
+                        current_chunk = sentence + " "
+                
+                if current_chunk:
+                    translated_parts.append(translator.translate(current_chunk.strip()))
+                
+                return ' '.join(translated_parts)
+            else:
+                return translator.translate(text)
+                
         except Exception as e:
             logger.error(f"Google 번역 오류: {e}")
-            # 대체 방법 시도
+            
+            # 대체 방법 시도 (직접 API 호출)
             try:
                 import requests
                 url = "https://translate.googleapis.com/translate_a/single"
                 params = {
                     'client': 'gtx',
-                    'sl': source_lang,
+                    'sl': source_lang if source_lang != 'auto' else 'auto',
                     'tl': target_lang,
                     'dt': 't',
                     'q': text
                 }
-                response = requests.get(url, params=params)
+                
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                
+                response = requests.get(url, params=params, headers=headers, timeout=10)
                 if response.status_code == 200:
                     result = response.json()
-                    return ''.join([item[0] for item in result[0] if item[0]])
-            except:
-                pass
+                    if result and isinstance(result, list) and result[0]:
+                        return ''.join([item[0] for item in result[0] if item[0]])
+            except Exception as fallback_error:
+                logger.error(f"대체 번역 방법도 실패: {fallback_error}")
+            
             raise
     
     def validate_key(self) -> bool:
@@ -415,11 +460,22 @@ class DocumentTranslatorCore:
         
         # 번역 서비스 확인
         if service not in self.translation_services:
-            raise ValueError(f"지원하지 않는 번역 서비스: {service}")
+            # OpenAI가 없으면 Google로 폴백
+            if 'google' in self.translation_services:
+                service = 'google'
+                logger.info(f"번역 서비스를 Google로 변경합니다.")
+            else:
+                raise ValueError(f"사용 가능한 번역 서비스가 없습니다.")
         
         translator = self.translation_services[service]
         if not translator.validate_key():
-            raise ValueError(f"{service} 서비스를 사용하려면 API 키가 필요합니다.")
+            # API 키가 없으면 Google로 폴백
+            if service != 'google' and 'google' in self.translation_services:
+                service = 'google'
+                translator = self.translation_services[service]
+                logger.info(f"API 키가 없어 Google 번역을 사용합니다.")
+            else:
+                raise ValueError(f"{service} 서비스를 사용하려면 API 키가 필요합니다.")
         
         # 번역 실행
         return translator.translate_text(text, source_lang, target_lang)
@@ -461,9 +517,11 @@ class DocumentTranslatorCore:
         if file_ext not in self.supported_formats:
             raise ValueError(f"지원하지 않는 파일 형식: {file_ext}")
         
-        # API 키 확인
-        if not self.validate_api_key(service):
-            raise ValueError(f"{service} 서비스를 사용하려면 API 키가 필요합니다.")
+        # API 키 확인 (Google은 항상 사용 가능)
+        if service != 'google' and not self.validate_api_key(service):
+            # Google로 폴백
+            logger.info(f"{service} API 키가 없어 Google 번역을 사용합니다.")
+            service = 'google'
         
         # 출력 디렉토리 설정
         if output_dir is None:
@@ -615,7 +673,8 @@ class DocumentTranslatorCore:
             'by_format': self.stats['by_format'],
             'supported_formats': list(self.supported_formats.keys()),
             'openai_configured': self.validate_api_key('openai'),
-            'deepl_configured': self.validate_api_key('deepl')
+            'deepl_configured': self.validate_api_key('deepl'),
+            'google_available': True  # Google은 항상 사용 가능
         }
     
     def estimate_cost(self, file_path: str, service: str = 'openai') -> Dict:
@@ -656,7 +715,7 @@ class DocumentTranslatorCore:
             }
         else:
             return {
-                'service': service,
+                'service': 'Google Translate',
                 'estimated_cost_usd': 0,
                 'estimated_cost_krw': 0,
                 'note': '무료 서비스입니다.'
