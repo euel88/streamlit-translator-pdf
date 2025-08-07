@@ -1,0 +1,43 @@
+# .streamlit/config.toml
+# Streamlit 애플리케이션 설정 파일
+
+[theme]
+# 테마 설정
+primaryColor = "#FF6B6B"           # 주 색상
+backgroundColor = "#FFFFFF"        # 배경색
+secondaryBackgroundColor = "#F0F2F6"  # 보조 배경색
+textColor = "#262730"              # 텍스트 색상
+font = "sans serif"                # 폰트
+
+[server]
+# 서버 설정
+maxUploadSize = 200                # 최대 업로드 크기 (MB)
+maxMessageSize = 200               # 최대 메시지 크기 (MB)
+enableCORS = false                 # CORS 활성화
+enableXsrfProtection = true        # XSRF 보호
+port = 8501                        # 포트 번호
+
+[browser]
+# 브라우저 설정
+gatherUsageStats = false           # 사용 통계 수집 비활성화
+serverAddress = "localhost"        # 서버 주소
+
+[runner]
+# 실행 설정
+magicEnabled = true                # Magic commands 활성화
+fastReruns = true                  # 빠른 재실행
+postScriptGC = true                # 스크립트 실행 후 가비지 컬렉션
+
+[client]
+# 클라이언트 설정
+showErrorDetails = true            # 오류 세부사항 표시
+toolbarMode = "viewer"             # 툴바 모드
+
+[logger]
+# 로깅 설정
+level = "info"                     # 로그 레벨
+messageFormat = "%(asctime)s %(message)s"  # 메시지 형식
+
+[deprecation]
+# 사용 중단 경고
+showPyplotGlobalUse = false        # pyplot 전역 사용 경고 비활성화
